@@ -5,6 +5,9 @@ import requests
 import random
 import os
 from datetime import datetime, timezone
+from dateutil.relativedelta import relativedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.exceptions import RequestException
 
 # Binance Futures Endpoints
 BASE_URL_BINANCE_INDEX = "https://fapi.binance.com/fapi/v1/indexPriceKlines"
@@ -14,6 +17,8 @@ BASE_URL_BINANCE_FUNDING_RATE = "https://fapi.binance.com/fapi/v1/fundingRate"
 
 # Deribit Endpoints
 BASE_URL_DERIBIT_TRADES = "https://history.deribit.com/api/v2/public/get_last_trades_by_instrument_and_time"
+BASE_URL_DERIBIT_FUNDING_RATE = "https://test.deribit.com/api/v2/public/get_funding_rate_history"
+
 
 # OKX Endpoints
 BASE_URL_OKX_MARK_PRICE_CANDLES = "https://www.okx.com/api/v5/market/history-mark-price-candles"
@@ -391,9 +396,9 @@ def get_price_klines(
     return clean_binance_klines_data(data) if clean else pd.DataFrame(data)
 
 
-# ============== Funding Rate ==============
+# ============== Funding Binance Rate ==============
 
-def clean_funding_rate_data(data: list) -> pd.DataFrame:
+def clean_funding_rate_data_binance(data: list) -> pd.DataFrame:
     """
     Clean Funding Rate data into DataFrame.
 
@@ -411,7 +416,7 @@ def clean_funding_rate_data(data: list) -> pd.DataFrame:
     df['fundingTime'] = pd.to_datetime(df['fundingTime'], unit='ms')
     return df
 
-def get_funding_rate_history(
+def get_funding_rate_history_binance(
     symbol: str = None,
     start_time: str = None,
     end_time: str = None,
@@ -496,7 +501,7 @@ def get_funding_rate_history(
     session.close()
     
     if clean:
-        return clean_funding_rate_data(all_data)
+        return clean_funding_rate_data_binance(all_data)  # 修正拼写错误
     else:
         return pd.DataFrame(all_data)
 
@@ -663,11 +668,13 @@ def clean_deribit_trades_data(data: dict) -> pd.DataFrame:
         timestamp = trade.get('timestamp')
         index_price = trade.get('index_price')
         mark_price = trade.get('mark_price')
+        amount = trade.get('amount')
         if timestamp and index_price and mark_price:
             records.append({
                 'timestamp': timestamp_ms_to_datetime(timestamp),
                 'index_price': float(index_price),
-                'mark_price': float(mark_price)
+                'mark_price': float(mark_price),
+                'amount': float(amount) if amount else None
             })
     
     df = pd.DataFrame(records)
@@ -700,8 +707,8 @@ def fetch_deribit_trades(
         pd.DataFrame
     """
     # 1) Convert start and end times to datetime and millisecond timestamps
-    start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    end_dt = datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    start_dt = parse_time(start_time).replace(tzinfo=timezone.utc)
+    end_dt = parse_time(end_time).replace(tzinfo=timezone.utc)
 
     start_ts = int(start_dt.timestamp() * 1000)
     end_ts = int(end_dt.timestamp() * 1000)
@@ -723,8 +730,6 @@ def fetch_deribit_trades(
         while retries < max_retries:
             try:
                 response = session.get(BASE_URL_DERIBIT_TRADES, params=params, timeout=10)
-                # Print the requested URL for debugging
-                print(response.url)
                 response.raise_for_status()
                 data = response.json()
 
@@ -787,7 +792,59 @@ def fetch_deribit_trades(
     else:
         return pd.DataFrame()
 
+def parse_time(time_string: str) -> datetime:
+    """
+    Parse time string, adapt to different time formats.
+    If a timestamp (float) is passed, convert it to datetime format.
+    """
+    if isinstance(time_string, float):  # If it's a timestamp
+        time_string = datetime.fromtimestamp(time_string).strftime('%Y-%m-%d %H:%M:%S')
+    
+    try:
+        # Try parsing two common formats
+        return datetime.strptime(time_string, '%Y-%m-%dT%H:%M:%S')  # Handle 'T' format
+    except ValueError:
+        return datetime.strptime(time_string, '%Y-%m-%d %H:%M:%S')  # Handle non-'T' format
+
+
 # ============== K-Line Aggregation ==============
+def create_time_intervals(start_time: str, end_time: str, count: int) -> list:
+    """
+    Generate a list of time intervals.
+    Assumes each interval has a fixed length; adjust as needed.
+    """
+    intervals = []
+    start_timestamp = parse_time(start_time).timestamp()
+    end_timestamp = parse_time(end_time).timestamp()
+    
+    interval_length = (end_timestamp - start_timestamp) / count
+    for i in range(count):
+        start_interval = start_timestamp + i * interval_length
+        end_interval = start_interval + interval_length
+        intervals.append((start_interval, end_interval))
+    
+    return intervals
+
+def fetch_all_trades_in_parallel(instrument_name: str, start_time: str, end_time: str, count: int, sorting: str) -> pd.DataFrame:
+    """
+    Download all data concurrently.
+    """
+    time_intervals = create_time_intervals(start_time, end_time, 7)
+    with ThreadPoolExecutor() as executor:
+        futures = {
+            executor.submit(fetch_deribit_trades, instrument_name, start, end, count, sorting): (start, end)
+            for start, end in time_intervals
+        }
+        results = []
+        for future in as_completed(futures):
+            try:
+                trades_df = future.result()
+                if not trades_df.empty:
+                    results.append(trades_df)
+            except Exception as exc:
+                print(f"Error fetching data: {exc}")
+        return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+
 
 def aggregate_trades_to_kline(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     """
@@ -824,9 +881,10 @@ def aggregate_trades_to_kline(df: pd.DataFrame, interval: str) -> pd.DataFrame:
         'min': 'mark_low',
         'last': 'mark_close'
     })
-    
+    volume_sum = df['amount'].resample(resample_rule).sum().rename('volume')
     # Combine the two OHLC data
-    kline_df = pd.concat([index_ohlc, mark_ohlc], axis=1).dropna().reset_index()
+    kline_df = pd.concat([index_ohlc, mark_ohlc, volume_sum], axis=1).dropna().reset_index()
+    
     
     # Rename the time column
     kline_df.rename(columns={'timestamp': 'open_time'}, inplace=True)
@@ -834,61 +892,52 @@ def aggregate_trades_to_kline(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     
     return kline_df
 
-# ============== Save K-Line Data ==============
-
 def save_deribit_kline_data(
     instrument_name: str,
     filename_prefix: str,
     start_time: str,
     end_time: str,
-    interval: str = '1T',  # '1T' means 1 minute, '5T' means 5 minutes, '1H' means 1 hour
-    count: int = 1000,  # Updated to 1000
-    sorting: str = 'asc',  # Use 'asc'
+    interval: str = '1T',  
+    count: int = 10000,    
+    sorting: str = 'asc',  
     **kwargs
 ) -> pd.DataFrame:
     """
-    Fetch and save Deribit's K-line data (including index and mark prices).
-    
-    Parameters:
-        instrument_name (str): Instrument name, e.g., 'BTC-28MAR25'
-        filename_prefix (str): Filename prefix
-        start_time (str): Start time 'YYYY-MM-DD HH:MM:SS'
-        end_time (str): End time 'YYYY-MM-DD HH:MM:SS'
-        interval (str): Time interval, e.g., '1T', '5T', '1H'
-        count (int): Number of trades per request
-        sorting (str): Sorting method 'asc' or 'desc'
-        **kwargs: Additional parameters
-    
-    Returns:
-        pd.DataFrame
+    Fetch and save Deribit's K-line data (including index and mark price).
     """
     if not os.path.exists('data'):
         os.makedirs('data')
-    
+
     friendly_start_time = filename_friendly_date(start_time)
     friendly_end_time = filename_friendly_date(end_time)
     filename = f'{filename_prefix}_{instrument_name}_{friendly_start_time}_{friendly_end_time}_{interval}.csv'
-    filepath = os.path.join('data', filename)
+    filepath = os.path.join('data', f'kline', filename)
     
-    # Fetch trade data
-    trades_df = fetch_deribit_trades(
-        instrument_name=instrument_name,
-        start_time=start_time,
-        end_time=end_time,
-        count=count,
-        sorting=sorting
-    )
+    filepath_raw = os.path.join('data', f'raw_data', f'raw_{filename_prefix}_{instrument_name}_{friendly_start_time}_{friendly_end_time}_{interval}.csv')
+    
+    # Concurrently download all trade data
+    trades_df = fetch_all_trades_in_parallel(instrument_name, start_time, end_time, count, sorting)
     
     if trades_df.empty:
         print("No trade data downloaded. Please check the API or time range.")
         return pd.DataFrame()
-    
+
+    # Save raw data to CSV
+    trades_df.to_csv(filepath_raw, index=False)
     # Aggregate into K-line data
     kline_df = aggregate_trades_to_kline(trades_df, interval)
     
     if not kline_df.empty:
         print(f"{filename} downloaded successfully. Saving data...")
-        kline_df.to_csv(filepath, index=False)
+        
+        # Asynchronously save file (example using a separate thread)
+        from threading import Thread
+        def save_async():
+            kline_df.to_csv(filepath, index=False)
+        
+        thread = Thread(target=save_async)
+        thread.start()
+        thread.join()  # Wait for file save to complete
     else:
         print("No K-line data generated. Possibly due to insufficient trade data or unreasonable interval settings.")
     
@@ -1552,6 +1601,7 @@ def fetch_all_mark_prices(
                     end_time=end_time,
                     interval=interval  # Adjust as needed
                 )
+                return mark_price_df
             elif exchange == 'okx':
                 inst_id = exchange_symbol  # OKX's Product ID
                 mark_price_df = save_okx_mark_price_data(
@@ -1586,37 +1636,170 @@ def fetch_all_mark_prices(
             print(f"=== Finished fetching Mark Price for {exchange.capitalize()} ===")
         except Exception as e:
             print(f"[Error] Failed to fetch data for {exchange.capitalize()}: {e}")
+            
+def clean_funding_rate_data_deribit(data: list) -> pd.DataFrame:
+    """
+    Clean Deribit funding rate data and convert it into a Pandas DataFrame.
+    
+    Parameters:
+        data (list): Raw funding rate data from Deribit API
+    
+    Returns:
+        pd.DataFrame: Cleaned funding rate data
+    """
+    if not data:
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(data)
+    # Convert timestamp to datetime
+    df['timestamp'] = df['timestamp'].apply(timestamp_ms_to_datetime)
+    # Rename columns
+    df.rename(columns={
+        'index_price': 'Index Price',
+        'prev_index_price': 'Previous Index Price',
+        'interest_8h': 'Interest 8H',
+        'interest_1h': 'Interest 1H'
+    }, inplace=True)
+
+    return df
+
+# ============== Deribit Funding Rate with Pagination ==================
+
+BASE_URL_DERIBIT_FUNDING_RATE = "https://www.deribit.com/api/v2/public/get_funding_rate_history"
+
+def get_funding_rate_history_deribit(
+    instrument_name: str,
+    start_time: str,
+    end_time: str,
+    limit_per_request: int = 1000,  # Maximum 1000 records per month
+    clean: bool = True
+) -> pd.DataFrame:
+    """
+    Fetch Deribit futures funding rate history, supports pagination for more than one month of data.
+    
+    Parameters:
+        instrument_name (str): Contract name, e.g., 'BTC-PERPETUAL'
+        start_time (str): Start time, format 'YYYY-MM-DD HH:MM:SS'
+        end_time (str): End time, format 'YYYY-MM-DD HH:MM:SS'
+        limit_per_request (int): Maximum records per request (default 1000)
+        clean (bool): Whether to clean data into DataFrame format
+    
+    Returns:
+        pd.DataFrame: Funding rate history data
+    """
+    # Convert start and end time to datetime objects
+    start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    end_dt = datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    
+    # Initialize parameters
+    current_start_ts = int(start_dt.timestamp() * 1000)
+    final_end_ts = int(end_dt.timestamp() * 1000)
+    
+    all_data = []
+    session = requests.Session()
+    retries = 0
+    max_retries = 5
+    backoff_factor = 0.5
+    
+    while current_start_ts < final_end_ts:
+        # Define current request end time as current start time + one month, or global end time
+        current_end_dt = datetime.fromtimestamp(current_start_ts / 1000, tz=timezone.utc) + relativedelta(months=1)
+        if current_end_dt.timestamp() * 1000 > final_end_ts:
+            current_end_dt = datetime.fromtimestamp(final_end_ts / 1000, tz=timezone.utc)
+        current_end_ts = int(current_end_dt.timestamp() * 1000)
+        
+        params = {
+            'instrument_name': instrument_name,
+            'start_timestamp': current_start_ts,
+            'end_timestamp': current_end_ts
+        }
+        
+        desc_str = f"Downloading Funding Rate History for {instrument_name} from {timestamp_ms_to_datetime(current_start_ts)} to {timestamp_ms_to_datetime(current_end_ts)}"
+        
+        try:
+            response = session.get(BASE_URL_DERIBIT_FUNDING_RATE, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'result' not in data:
+                print(f"[Error] {desc_str}: Unexpected response structure.")
+                break
+            
+            funding_data = data['result']
+            
+            if not funding_data:
+                print(f"[Info] {desc_str}: No data returned for this period.")
+                current_start_ts = current_end_ts
+                continue
+            
+            all_data.extend(funding_data)
+            print(f"[Info] {desc_str}: Fetched {len(funding_data)} records. Total so far: {len(all_data)}")
+            
+            # If data limit reached, move to next page
+            if len(funding_data) >= limit_per_request:
+                last_record_ts = funding_data[-1]['timestamp'] + 1
+                current_start_ts = last_record_ts
+            else:
+                current_start_ts = current_end_ts
+            
+            # Random sleep to avoid being banned
+            time.sleep(random.uniform(0.1, 0.3))
+        
+        except requests.exceptions.RequestException as e:
+            wait_time = backoff_factor * (2 ** retries)
+            print(f"[Error] {desc_str}: Request failed: {e}. Retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+            retries += 1
+            if retries >= max_retries:
+                print(f"[Error] {desc_str}: Maximum retries reached. Stopping data retrieval.")
+                break
+            continue  # Retry the current time period
+        
+    session.close()
+    
+    if clean:
+        return clean_funding_rate_data_deribit(all_data)
+    else:
+        return pd.DataFrame(all_data)
 
 # ============== Main Execution ==============
 
 if __name__ == '__main__':
 
     # ====== Index Price =======
-    pair_for_index = 'BTCUSD'
+    pair_for_index = 'ETHUSD'
     index_price_df = getsave_data_kline(
         get_index_price_klines,
         filename_prefix=f'{pair_for_index}_indexPrice',
         pair=pair_for_index,
-        start_time="2025-01-04 16:00:00",
-        end_time="2025-01-05 08:00:00",
+        start_time = "2021-12-31 00:00:00",
+        end_time = "2025-01-15 00:00:00",
         interval='8h'
     )
     
     # == Mark Price == 
-    base_symbol = 'BTC'
+    base_symbol = 'ETH'
     expiry = '250328'  # Format like '250328'
-    start_time = "2025-01-04 16:00:00"
-    end_time = "2025-01-05 08:00:00"
+    start_time = "2024-12-28 00:00:00"
+    end_time = "2025-01-01 16:00:00"
     interval = '8h'  # Time interval > 4H for OKX
-
-    exchanges = ['binance', 'deribit', 'okx', 'bybit']
+    exchanges = ['deribit']
 
     
-    fetch_all_mark_prices(
+    mark_price_df = fetch_all_mark_prices(
         base_symbol=base_symbol,
         expiry=expiry,
         start_time=start_time,
         end_time=end_time,
         interval=interval,
         exchanges=exchanges
+    )
+    
+    # funding rate
+    instrument = "ETH-PERPETUAL"
+    df_funding = get_funding_rate_history_deribit(
+        instrument_name=instrument,
+        start_time=start_time,
+        end_time=end_time,
+        clean=True
     )
