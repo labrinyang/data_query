@@ -1,0 +1,9 @@
+pytz
+pandas
+requests
+plotly
+numpy
+matplotlib
+seaborn
+juypyter
+notebook
